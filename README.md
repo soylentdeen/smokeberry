@@ -12,9 +12,14 @@ Description
 -----------
 
 Smoked Raspbery is a suite of programs which allow one to:
-* Measure grill temperature via a Temperature Probe
+* Measure multiple grill temperatures via Temperature Probes
+* Measure meat temperature (via a meat thermometer)
+* Monitor/Control air flow via a PWM fan
+* Adjust parameters of the control loop
+* calibrate parameters of the control loop
 * Manually enter meat temperature (via a dumb meat thermometer)
 * Skeet if grill temperature is outside accepted norms (too hot/cold)
+* Publish all temperatures to a SSH port
 * Periodically plot interesting temperatures and upload to a website so that the masses can obsess over them.
 
 This should be interesting...
