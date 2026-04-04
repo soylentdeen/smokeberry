@@ -1,4 +1,4 @@
-Smoked Raspberry
+Smokeberry
 ==========
 
 Code for controlling a smoker with a Rasberry Pi
