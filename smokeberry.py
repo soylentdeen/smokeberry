@@ -3,12 +3,22 @@ import glob
 import time
 import requests
 from prometheus_client import CollectorRegistry, Gauge, generate_latest
+import threading
+import time
+import queue
+import sys
+import signal
 
 VICTORIA_PUSH_URL = "http://192.168.178.113:8428/api/v1/prom/remote/write"
 NAS_PATH = "/var/lib/victoria-metrics/"
 #NAS_PATH = "/mnt/vmdata/Data/Smokeberry/"
 
 HTTP_HEADERS = {"Content-Type": "application/x-protobuf"}
+
+stop_event = threading.Event()
+command_q = queue.Queue()
+latest_value_lock = threading.Lock()
+latest_value = None
 
 if not os.path.isdir(NAS_PATH):
     os.makedirs(NAS_PATH, exist_ok=True)
@@ -63,16 +73,121 @@ def push_to_victoriametrics(sample):
         print("Push error: ", e)
         return False
 
-def main():
-    while True:
-        sample = read_temps()
-        print(sample)
-        if len(sample) == 2:
-            ok = push_to_victoriametrics(sample)
-            print(time.strftime("%Y-%m-%d %H:%M:%S"), "Sample :", sample, "pushed: ", ok)
+def sensor_loop(poll_interval):
+    global latest_value
+    print("Ä: ", poll_interval)
+    while not stop_event.is_set():
+        try:
+            temperature_samples = read_temps()
+        except Exception as e:
+            # handle sensor read error
+            temperature_samples = None
+            print(f"[sensor] read error: {e}", file=sys.stderr)
+        with latest_value_lock:
+            latest_value = temperature_samples
+        # Simple processing example: print if value exceeds a threshold
+
+        if len(temperature_samples) == 2:
+            ok = push_to_victoriametrics(temperature_samples)
         else:
             print(time.strftime("%Y-%m-%d %H:%M:%S"), "Sensor read failed")
-        time.sleep(1)
+        print("Poll Interval :", poll_interval)
+        time.sleep(poll_interval)
+
+def input_loop():
+    help_text = (
+        "Commands:\n"
+        "  read       - print latest sensor value\n"
+        "  start      - ensure sensor polling is running\n"
+        "  stop       - pause sensor polling\n"
+        "  setrate N  - set poll interval to N seconds (float)\n"
+        "  quit / exit- exit program\n"
+        "  help       - show this message\n"
+    )
+    print(help_text)
+    poll_interval = 5.0
+    polling_thread = None
+
+    # helper to (re)start polling thread
+    def ensure_polling():
+        nonlocal polling_thread
+        print('Restarting Polling Thread: ', poll_interval)
+        if polling_thread is None or not polling_thread.is_alive():
+            polling_thread = threading.Thread(target=sensor_loop, args=(poll_interval,), daemon=True)
+            polling_thread.start()
+
+    ensure_polling()
+
+    while not stop_event.is_set():
+        try:
+            cmd = input("> ").strip()
+        except EOFError:
+            # e.g., user pressed Ctrl+D
+            stop_event.set()
+            break
+        if not cmd:
+            continue
+        parts = cmd.split()
+        c = parts[0].lower()
+        if c in ("quit", "exit"):
+            stop_event.set()
+            break
+        elif c == "help":
+            print(help_text)
+        elif c == "read":
+            with latest_value_lock:
+                print(time.strftime("%Y-%m-%d %H:%M:%S"), "Sample :", latest_value)
+        elif c == "stop":
+            stop_event.set()
+            print("Stopping sensor polling...")
+            # Create a new event so program can be restarted? Keep simple: exit loop.
+        elif c == "start":
+            if stop_event.is_set():
+                print("Cannot restart after stop in this run. Please restart program.")
+            else:
+                ensure_polling()
+                print("Polling running.")
+        elif c == "setrate":
+            if len(parts) >= 2:
+                try:
+                    new_rate = float(parts[1])
+                    if new_rate <= 0:
+                        raise ValueError
+                    poll_interval = new_rate
+                    # restart polling thread with new interval by stopping and starting a new thread
+                    stop_event.set()
+                    time.sleep(0.1)
+                    # reset and start fresh
+                    stop_event.clear()
+                    ensure_polling()
+                    print('B: Polling Interval :', poll_interval)
+                    print(f"Poll interval set to {poll_interval} s")
+                except ValueError:
+                    print("Invalid rate. Provide a positive number, e.g.,: setrate 0.2")
+                print('C: Polling Interval :', poll_interval)
+            else:
+                print("Usage: setrate N")
+        else:
+            print("Unknown command. Type 'help'.")
+
+
+def main():
+    def _sigint_handler(signum, frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    input_thread = threading.Thread(target=input_loop, daemon=True)
+    input_thread.start()
+
+    try:
+        while input_thread.is_alive():
+            input_thread.join(timeout=0.5)
+    except KeyboardInterrupt:
+        stop_event.set()
+
+    print("Shutting down...")
+
 
 if __name__ == "__main__":
     main()
