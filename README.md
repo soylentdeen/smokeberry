@@ -11,7 +11,7 @@ The last time I smoked a brisket, I was bombarded by constant requests for statu
 System Description
 -----------
 
-Smoked Raspbery is a suite of handware and programs which allow one to:
+Smokeberry is a suite of handware and programs which allow one to:
 * Measure multiple grill temperatures via Temperature Probes
 * Measure meat temperature (via a meat thermometer)
 * Monitor/Control air flow via a PWM fan
