@@ -6,12 +6,12 @@ Code for controlling a smoker with a Rasberry Pi
 Motivation
 ----------
 
-The last time I smoked a brisket, I was bombarded by constant requests for status updates on the brisket.  (Of course, by "bombarded" I mean that a certain impatient Dutch astronomer would rather bug me from afar than come over and help me drink beer and see for his damn self)  To placate the masses (i.e. Remco) I have started grillduino.
+The last time I smoked a brisket, I was bombarded by constant requests for status updates on the brisket.  (Of course, by "bombarded" I mean that a certain impatient Dutch astronomer would rather bug me from afar than come over and help me drink beer and see for his damn self)  To placate the masses (i.e. Remco) I have started smokeberry.
 
 System Description
 -----------
 
-Smoked Raspbery is a suite of handware and programs which allow one to:
+Smokeberry is a suite of handware and programs which allow one to:
 * Measure multiple grill temperatures via Temperature Probes
 * Measure meat temperature (via a meat thermometer)
 * Monitor/Control air flow via a PWM fan
