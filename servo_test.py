@@ -49,7 +49,7 @@ if __name__ == "__main__":
     try:
         pwm = setup()
         step = 5
-        delay = 0.02  # seconds between small steps for smooth motion
+        delay = 0.1  # seconds between small steps for smooth motion
 
         # Sweep up
         for ang in range(0, 181, step):
