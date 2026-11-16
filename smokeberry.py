@@ -2,10 +2,7 @@ import os
 import glob
 import time
 import requests
-from prometheus_client import CollectorRegistry, Gauge, generate_latest
 import threading
-import time
-import queue
 import sys
 import signal
 import RPi.GPIO as GPIO
@@ -56,7 +53,16 @@ def set_speed(pwm, duty):
     fan_dutyCycleSetPoint = duty
     pwm.ChangeDutyCycle(duty)
 
+_cleanup_lock = threading.Lock()
+_cleaned_up = False
+
 def cleanup(pwm):
+    # May be reached from more than one path on shutdown; only run once.
+    global _cleaned_up
+    with _cleanup_lock:
+        if _cleaned_up:
+            return
+        _cleaned_up = True
     try:
         pwm.ChangeDutyCycle(0)
     except Exception:
@@ -66,113 +72,119 @@ def cleanup(pwm):
     GPIO.cleanup()
 
 def signal_handler(sig, frame):
+    # Just request shutdown; main() does the cleanup in its finally block.
     stop_event.set()
-    cleanup(pwm_instance)
-    sys.exit(0)
 
-VICTORIA_PUSH_URL = "http://192.168.178.113:8428/api/v1/prom/remote/write"
-NAS_PATH = "/var/lib/victoria-metrics/"
-#NAS_PATH = "/mnt/vmdata/Data/Smokeberry/"
+VICTORIA_IMPORT_URL = "http://192.168.178.113:8428/api/v1/import/prometheus"
+PUSH_TIMEOUT_SEC = 5.0
 
-HTTP_HEADERS = {"Content-Type": "application/x-protobuf"}
-
-stop_event = threading.Event()
-command_q = queue.Queue()
+stop_event = threading.Event()      # whole program is shutting down
+polling_stop = threading.Event()    # pause the sensor thread ("stop" command)
+poll_wakeup = threading.Event()     # interrupt the sensor thread's wait early
+poll_interval = 5.0                 # seconds; read by sensor_loop on every pass
 latest_value_lock = threading.Lock()
 latest_value = None
-
-if not os.path.isdir(NAS_PATH):
-    os.makedirs(NAS_PATH, exist_ok=True)
 
 os.system('modprobe w1-gpio')
 os.system('modprobe w1-therm')
 
 base_dir = '/sys/bus/w1/devices/'
-device_folders =  glob.glob(base_dir + '28*')
+# Sorted so temp_1, temp_2, ... map to the same probes after every reboot.
+device_folders = sorted(glob.glob(base_dir + '28*'))
+device_files = [folder + '/w1_slave' for folder in device_folders]
 
-i = 1
-device_files = []
-for folder in device_folders:
-    device_files.append(folder + '/w1_slave')
-    i+=1
+TEMP_READ_RETRIES = 5
 
 def read_temp_raw(therm):
-    f = open(therm, 'r')
-    lines = f.readlines()
-    f.close()
-    return lines
-    
+    with open(therm, 'r') as f:
+        return f.readlines()
+
+def read_one_temp(thermometer):
+    """Return the probe temperature in C, or None if it can't be read."""
+    for _ in range(TEMP_READ_RETRIES):
+        lines = read_temp_raw(thermometer)
+        if len(lines) >= 2 and lines[0].strip()[-3:] == 'YES':
+            equals_pos = lines[1].find('t=')
+            if equals_pos != -1:
+                return float(lines[1][equals_pos+2:]) / 1000.0
+        time.sleep(0.2)
+    return None
+
 def read_temps():
+    """One entry per probe, in device_files order; None for a failed probe."""
     temperatures = []
     for thermometer in device_files:
-        lines = read_temp_raw(thermometer)
-        while lines[0].strip()[-3:] != 'YES':
-            time.sleep(0.2)
-            lines = read_temp_raw(thermometer)
-        equals_pos = lines[1].find('t=')
-        if equals_pos != -1:
-            temp_string = lines[1][equals_pos+2:]
-            temp_c = float(temp_string) / 1000.0
-            temperatures.append(temp_c)
+        try:
+            temperatures.append(read_one_temp(thermometer))
+        except Exception as e:
+            print(f"[sensor] {thermometer}: {e}", file=sys.stderr)
+            temperatures.append(None)
     return temperatures
-	    
+
 def push_to_victoriametrics(temperature_samples, fan_samples):
     ts_ms = int(time.time() * 1000)
-    #print(ts_ms)
     lines = []
     for i, t_samp in enumerate(temperature_samples):
-        lines.append(f"temp_{i+1}_c {t_samp} {ts_ms}")
-    
-    lines.append(f"fan_duty_cycle {fan_samples[0]} {ts_ms}")
-    lines.append(f"fan_rpm {fan_samples[1]} {ts_ms}")
-    
+        if t_samp is not None:
+            lines.append(f"temp_{i+1}_c {t_samp} {ts_ms}")
+
+    if fan_samples is not None:
+        lines.append(f"fan_duty_cycle {fan_samples[0]} {ts_ms}")
+        lines.append(f"fan_rpm {fan_samples[1]} {ts_ms}")
+
+    if not lines:
+        return False
+
     payload = "\n".join(lines) + "\n"
-    #print(payload)
-    url = VICTORIA_PUSH_URL.replace("/prom/remote/write", "/import/prometheus")
     try:
-        resp = requests.post(url, data=payload.encode("utf-8"), headers={"Content-Type": "text/plain"})
+        resp = requests.post(VICTORIA_IMPORT_URL, data=payload.encode("utf-8"),
+                             headers={"Content-Type": "text/plain"},
+                             timeout=PUSH_TIMEOUT_SEC)
         resp.raise_for_status()
         return True
     except Exception as e:
-        print("Push error: ", e)
+        print("Push error: ", e, file=sys.stderr)
         return False
 
-def sensor_loop(poll_interval):
+def sensor_loop():
     global latest_value
-    #print("Ä: ", poll_interval)
-    while not stop_event.is_set():
-        try:
-            temperature_samples = read_temps()
-        except Exception as e:
-            # handle sensor read error
-            temperature_samples = None
-            print(f"[sensor] read error: {e}", file=sys.stderr)
-        #with latest_value_lock:
-        #    latest_value = temperature_samples
+    # Discard pulses counted while polling wasn't running.
+    read_and_reset_pulses()
+    last_rpm_time = time.monotonic()
 
+    while not (stop_event.is_set() or polling_stop.is_set()):
+        # Fan: divide by the real elapsed time, not the nominal poll interval,
+        # since sensor reads and the HTTP push also take time.
         try:
             pulses = read_and_reset_pulses()
-            fan_rpm = compute_rpm(pulses, poll_interval)
+            now = time.monotonic()
+            fan_rpm = compute_rpm(pulses, now - last_rpm_time)
+            last_rpm_time = now
             fan_samples = [fan_dutyCycleSetPoint, fan_rpm]
         except Exception as e:
             fan_samples = None
             print(f"Fan read error: {e}", file=sys.stderr)
+
+        temperature_samples = read_temps()
+        if any(t is None for t in temperature_samples):
+            print(time.strftime("%Y-%m-%d %H:%M:%S"), "Sensor read failed:",
+                  temperature_samples, file=sys.stderr)
+
         with latest_value_lock:
             latest_value = [temperature_samples, fan_samples]
 
-        if (len(temperature_samples) == 2) and (len(fan_samples) == 2):
-            ok = push_to_victoriametrics(temperature_samples, fan_samples)
-        else:
-            print(time.strftime("%Y-%m-%d %H:%M:%S"), "Sensor read failed")
-        print("Poll Interval :", poll_interval)
-        time.sleep(poll_interval)
+        push_to_victoriametrics(temperature_samples, fan_samples)
+
+        # Wait for the interval, but wake immediately on setrate/stop/quit.
+        poll_wakeup.wait(poll_interval)
+        poll_wakeup.clear()
 
 def input_loop():
-    global pwm_instance
+    global poll_interval
     help_text = (
         "Commands:\n"
         "  read            - print latest sensor value\n"
-        "  start           - ensure sensor polling is running\n"
+        "  start           - resume sensor polling\n"
         "  stop            - pause sensor polling\n"
         "  setrate N       - set poll interval to N seconds (float)\n"
         "  setfan <0-100>  - set Fan duty cycle\n"
@@ -180,15 +192,15 @@ def input_loop():
         "  help            - show this message\n"
     )
     print(help_text)
-    poll_interval = 5.0
     polling_thread = None
 
     # helper to (re)start polling thread
     def ensure_polling():
         nonlocal polling_thread
-        #print('Restarting Polling Thread: ', poll_interval)
         if polling_thread is None or not polling_thread.is_alive():
-            polling_thread = threading.Thread(target=sensor_loop, args=(poll_interval,), daemon=True)
+            polling_stop.clear()
+            poll_wakeup.clear()
+            polling_thread = threading.Thread(target=sensor_loop, daemon=True)
             polling_thread.start()
 
     ensure_polling()
@@ -213,15 +225,14 @@ def input_loop():
             with latest_value_lock:
                 print(time.strftime("%Y-%m-%d %H:%M:%S"), "Sample :", latest_value)
         elif c == "stop":
-            stop_event.set()
-            print("Stopping sensor polling...")
-            # Create a new event so program can be restarted? Keep simple: exit loop.
+            polling_stop.set()
+            poll_wakeup.set()
+            if polling_thread is not None:
+                polling_thread.join()
+            print("Sensor polling paused. Type 'start' to resume.")
         elif c == "start":
-            if stop_event.is_set():
-                print("Cannot restart after stop in this run. Please restart program.")
-            else:
-                ensure_polling()
-                print("Polling running.")
+            ensure_polling()
+            print("Polling running.")
         elif c == "setrate":
             if len(parts) >= 2:
                 try:
@@ -229,17 +240,10 @@ def input_loop():
                     if new_rate <= 0:
                         raise ValueError
                     poll_interval = new_rate
-                    # restart polling thread with new interval by stopping and starting a new thread
-                    stop_event.set()
-                    time.sleep(0.1)
-                    # reset and start fresh
-                    stop_event.clear()
-                    ensure_polling()
-                    print('B: Polling Interval :', poll_interval)
+                    poll_wakeup.set()   # cut the current wait short
                     print(f"Poll interval set to {poll_interval} s")
                 except ValueError:
                     print("Invalid rate. Provide a positive number, e.g.,: setrate 0.2")
-                print('C: Polling Interval :', poll_interval)
             else:
                 print("Usage: setrate N")
         elif c == "setfan":
@@ -248,7 +252,8 @@ def input_loop():
                     set_speed(pwm_instance, float(parts[1]))
                 except ValueError:
                     print("Invalid value!")
-                continue
+            else:
+                print("Usage: setfan <0-100>")
         else:
             print("Unknown command. Type 'help'.")
 
@@ -262,20 +267,14 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     input_thread = threading.Thread(target=input_loop, daemon=True)
-    #monitor_thread = threading.Thread(target=rpm_monitor_loop, args=(stop_event,), daemon=True)
-
     input_thread.start()
-    #monitor_thread.start()
 
     try:
-        #while (input_thread.is_alive()) and (monitor_thread.is_alive()):
-        while input_thread.is_alive():
+        while input_thread.is_alive() and not stop_event.is_set():
             input_thread.join(timeout=0.5)
-    except KeyboardInterrupt:
-        stop_event.set()
     finally:
         stop_event.set()
-        #monitor_thread.join(timeout=1.0)
+        poll_wakeup.set()
         cleanup(pwm_instance)
 
     print("Shutting down...")
